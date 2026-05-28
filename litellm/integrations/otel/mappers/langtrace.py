@@ -3,67 +3,63 @@
 V1 reached Langtrace via ``callback_name == "langtrace"`` string dispatch
 inside ``set_attributes``. V2 makes it an explicit mapper that customers
 compose like any other vocabulary.
+
+Scalar attributes are declared as a flat ``key -> extractor`` table (one lambda
+per mapping operation); the prompt/completion blobs are serialized as a tail.
 """
 
-import json
+from typing import Callable, Dict, Optional
 
-from litellm.integrations.otel.mappers.base import AttributeMap, SpanData
+from litellm.integrations.otel.mappers.base import AttributeMap, AttrValue, SpanData
+from litellm.integrations.otel.mappers.utils import (
+    collect,
+    json_or_none,
+    output_messages,
+)
 from litellm.integrations.otel.payloads import LLMCallSpanData
 from litellm.integrations.otel.spans import SpanRole
 
 
 class LangtraceMapper:
-    """Maps ``LLMCallSpanData`` to Langtrace's vendor attributes."""
+
+    _LLM_CALL_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
+        "gen_ai.operation.name": lambda d: "chat",
+        "langtrace.service.name": lambda d: d.provider or None,
+        "llm.model": lambda d: d.request_model or None,
+        "gen_ai.response.model": lambda d: d.response_model or None,
+        "gen_ai.response_id": lambda d: d.response_id or None,
+        "gen_ai.system_fingerprint": lambda d: d.system_fingerprint or None,
+        "llm.temperature": lambda d: d.request_params.temperature,
+        "llm.top_p": lambda d: d.request_params.top_p,
+        "llm.top_k": lambda d: d.request_params.top_k,
+        "llm.max_tokens": lambda d: d.request_params.max_tokens,
+        "llm.frequency_penalty": lambda d: d.request_params.frequency_penalty,
+        "llm.presence_penalty": lambda d: d.request_params.presence_penalty,
+        "llm.stream": lambda d: d.is_streaming,
+        "llm.token.counts.prompt": lambda d: d.usage.input_tokens,
+        "llm.token.counts.completion": lambda d: d.usage.output_tokens,
+        "llm.token.counts.total": lambda d: d.usage.total_tokens,
+    }
+
+    _BLOB_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
+        "llm.prompts": lambda d: (
+            json_or_none(list(d.messages_in)) if d.messages_in else None
+        ),
+        "llm.completions": lambda d: (
+            json_or_none(output_messages(d)) if d.choices_out else None
+        ),
+    }
 
     def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        if not isinstance(data, LLMCallSpanData):
-            return {}
-        attrs: AttributeMap = {"gen_ai.operation.name": "chat"}
-        if data.provider:
-            attrs["langtrace.service.name"] = data.provider
-        if data.request_model:
-            attrs["llm.model"] = data.request_model
-        if data.response_model:
-            attrs["gen_ai.response.model"] = data.response_model
-        if data.response_id:
-            attrs["gen_ai.response_id"] = data.response_id
-        if data.system_fingerprint:
-            attrs["gen_ai.system_fingerprint"] = data.system_fingerprint
-        rp = data.request_params
-        if rp.temperature is not None:
-            attrs["llm.temperature"] = rp.temperature
-        if rp.top_p is not None:
-            attrs["llm.top_p"] = rp.top_p
-        if rp.top_k is not None:
-            attrs["llm.top_k"] = rp.top_k
-        if rp.max_tokens is not None:
-            attrs["llm.max_tokens"] = rp.max_tokens
-        if rp.frequency_penalty is not None:
-            attrs["llm.frequency_penalty"] = rp.frequency_penalty
-        if rp.presence_penalty is not None:
-            attrs["llm.presence_penalty"] = rp.presence_penalty
-        if data.is_streaming is not None:
-            attrs["llm.stream"] = data.is_streaming
-        if data.usage.input_tokens is not None:
-            attrs["llm.token.counts.prompt"] = data.usage.input_tokens
-        if data.usage.output_tokens is not None:
-            attrs["llm.token.counts.completion"] = data.usage.output_tokens
-        if data.usage.total_tokens is not None:
-            attrs["llm.token.counts.total"] = data.usage.total_tokens
-        # Prompts + completions serialized into Langtrace's blob shape.
-        if data.messages_in:
-            try:
-                attrs["llm.prompts"] = json.dumps(list(data.messages_in), default=str)
-            except Exception:
-                pass
-        if data.choices_out:
-            completions = [
-                choice.get("message")
-                for choice in data.choices_out
-                if isinstance(choice, dict)
-            ]
-            try:
-                attrs["llm.completions"] = json.dumps(completions, default=str)
-            except Exception:
-                pass
-        return attrs
+        match data:
+            case LLMCallSpanData():
+                return self._llm_call(data)
+            case _:
+                return {}
+
+    @classmethod
+    def _llm_call(cls, data: LLMCallSpanData) -> AttributeMap:
+        return {
+            **collect(cls._LLM_CALL_ATTRS, data),
+            **collect(cls._BLOB_ATTRS, data),
+        }

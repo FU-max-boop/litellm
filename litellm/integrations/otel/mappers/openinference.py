@@ -7,29 +7,22 @@ Phoenix + any other OpenInference-aware backend simultaneously.
 """
 
 import json
-from typing import Optional
+from typing import Callable, Dict, Optional, Sequence
 
-from litellm.integrations.otel.mappers.base import AttributeMap, SpanData
-from litellm.integrations.otel.payloads import LLMCallSpanData
+from litellm.integrations.otel.mappers.base import AttributeMap, AttrValue, SpanData
+from litellm.integrations.otel.mappers.utils import (
+    collect,
+    drop_none,
+    json_if,
+    message_content,
+    output_messages,
+)
+from litellm.integrations.otel.payloads import (
+    LLMCallSpanData,
+    LLMRequestParams,
+    ToolDefinition,
+)
 from litellm.integrations.otel.spans import SpanRole
-
-
-def _message_content(message: object) -> Optional[str]:
-    """Extract the textual ``content`` from a chat message dict."""
-    if not isinstance(message, dict):
-        return None
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        # multimodal: concatenate text parts only
-        parts = [
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ]
-        return "".join(p for p in parts if isinstance(p, str)) or None
-    return None
 
 
 class OpenInferenceMapper:
@@ -44,71 +37,93 @@ class OpenInferenceMapper:
     - ``input.value`` / ``output.value`` — JSON-serialized request / response
     """
 
+    _LLM_CALL_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
+        "openinference.span.kind": lambda d: "LLM",
+        "llm.model_name": lambda d: d.request_model or None,
+        "llm.provider": lambda d: d.provider or None,
+        "llm.token_count.prompt": lambda d: d.usage.input_tokens,
+        "llm.token_count.completion": lambda d: d.usage.output_tokens,
+        "llm.token_count.total": lambda d: d.usage.total_tokens,
+    }
+
+    # Folded into the ``llm.invocation_parameters`` JSON blob.
+    _INVOCATION_PARAMS: Dict[str, Callable[[LLMRequestParams], Optional[AttrValue]]] = {
+        "temperature": lambda rp: rp.temperature,
+        "top_p": lambda rp: rp.top_p,
+        "top_k": lambda rp: rp.top_k,
+        "max_tokens": lambda rp: rp.max_tokens,
+        "frequency_penalty": lambda rp: rp.frequency_penalty,
+        "presence_penalty": lambda rp: rp.presence_penalty,
+        "seed": lambda rp: rp.seed,
+    }
+
+    # Per-tool extractors, keyed by the ``llm.tools.{idx}.*`` suffix.
+    _TOOL_ATTRS: Dict[str, Callable[[ToolDefinition], Optional[AttrValue]]] = {
+        "tool.name": lambda t: t.name,
+        "tool.description": lambda t: t.description or None,
+        "tool.json_schema": lambda t: t.parameters_json or None,
+    }
+
+    # JSON-payload attributes: each builder returns the serialized blob or None.
+    _BLOB_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
+        "llm.invocation_parameters": lambda d: json_if(
+            collect(OpenInferenceMapper._INVOCATION_PARAMS, d.request_params)
+        ),
+    }
+
     def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        if not isinstance(data, LLMCallSpanData):
-            return {}
-        attrs: AttributeMap = {"openinference.span.kind": "LLM"}
-        if data.request_model:
-            attrs["llm.model_name"] = data.request_model
-        if data.provider:
-            attrs["llm.provider"] = data.provider
-        rp = data.request_params
-        invocation: dict = {}
-        for key, value in (
-            ("temperature", rp.temperature),
-            ("top_p", rp.top_p),
-            ("top_k", rp.top_k),
-            ("max_tokens", rp.max_tokens),
-            ("frequency_penalty", rp.frequency_penalty),
-            ("presence_penalty", rp.presence_penalty),
-            ("seed", rp.seed),
-        ):
-            if value is not None:
-                invocation[key] = value
-        if invocation:
-            attrs["llm.invocation_parameters"] = json.dumps(invocation)
+        match data:
+            case LLMCallSpanData():
+                return self._llm_call(data)
+            case _:
+                return {}
 
-        # Input messages — flat numbered keys per OpenInference.
-        input_blob: list = []
-        for idx, msg in enumerate(data.messages_in):
-            role_val = msg.get("role") if isinstance(msg, dict) else None
-            if isinstance(role_val, str):
-                attrs[f"llm.input_messages.{idx}.message.role"] = role_val
-            content = _message_content(msg)
-            if content is not None:
-                attrs[f"llm.input_messages.{idx}.message.content"] = content
-            input_blob.append({"role": role_val, "content": content})
-        if input_blob:
-            attrs["input.value"] = json.dumps(input_blob)
+    @classmethod
+    def _llm_call(cls, data: LLMCallSpanData) -> AttributeMap:
+        return {
+            **collect(cls._LLM_CALL_ATTRS, data),
+            **collect(cls._BLOB_ATTRS, data),
+            **cls._messages("llm.input_messages", "input.value", data.messages_in),
+            **cls._messages(
+                "llm.output_messages", "output.value", output_messages(data)
+            ),
+            **cls._tools(data),
+        }
 
-        # Output messages — only the chosen completion(s).
-        output_blob: list = []
-        for idx, choice in enumerate(data.choices_out):
-            if not isinstance(choice, dict):
-                continue
-            message = choice.get("message")
-            role_val = message.get("role") if isinstance(message, dict) else None
-            if isinstance(role_val, str):
-                attrs[f"llm.output_messages.{idx}.message.role"] = role_val
-            content = _message_content(message)
-            if content is not None:
-                attrs[f"llm.output_messages.{idx}.message.content"] = content
-            output_blob.append({"role": role_val, "content": content})
-        if output_blob:
-            attrs["output.value"] = json.dumps(output_blob)
-
-        # Tools (declared on the request).
-        for idx, tool in enumerate(data.tools):
-            attrs[f"llm.tools.{idx}.tool.name"] = tool.name
-            if tool.description:
-                attrs[f"llm.tools.{idx}.tool.description"] = tool.description
-            if tool.parameters_json:
-                attrs[f"llm.tools.{idx}.tool.json_schema"] = tool.parameters_json
-
-        if data.usage.input_tokens is not None:
-            attrs["llm.token_count.prompt"] = data.usage.input_tokens
-        if data.usage.output_tokens is not None:
-            attrs["llm.token_count.completion"] = data.usage.output_tokens
-        if data.usage.total_tokens is not None:
-            attrs["llm.token_count.total"] = data.usage.total_tokens
+    @staticmethod
+    def _messages(
+        prefix: str, value_key: str, messages: Sequence[object]
+    ) -> AttributeMap:
+        """Per-message ``{prefix}.{idx}.message.*`` keys + the ``value_key`` blob."""
+        parsed = [
+            (m.get("role") if isinstance(m, dict) else None, message_content(m))
+            for m in messages
+        ]
+        attrs = drop_none(
+            {
+                key: value
+                for idx, (role, content) in enumerate(parsed)
+                for key, value in (
+                    (
+                        f"{prefix}.{idx}.message.role",
+                        role if isinstance(role, str) else None,
+                    ),
+                    (f"{prefix}.{idx}.message.content", content),
+                )
+            }
+        )
+        if parsed:
+            attrs[value_key] = json.dumps(
+                [{"role": role, "content": content} for role, content in parsed]
+            )
         return attrs
+
+    @classmethod
+    def _tools(cls, data: LLMCallSpanData) -> AttributeMap:
+        return drop_none(
+            {
+                f"llm.tools.{idx}.{suffix}": extract(tool)
+                for idx, tool in enumerate(data.tools)
+                for suffix, extract in cls._TOOL_ATTRS.items()
+            }
+        )

@@ -2,93 +2,111 @@
 
 Owns the attribute schema for every span kind the engine emits — LLM call,
 guardrail, and service — so the engine itself never references attribute keys.
+
+Each span kind declares its schema as a flat ``attribute key -> extractor``
+table: one lambda per mapping operation, applied against the typed span data.
 """
 
-from litellm.integrations.otel.mappers.base import (
-    AttributeMap,
-    SpanData,
-    drop_none,
-)
+from typing import Callable, Dict, Optional
+
+from litellm.integrations.otel.mappers.base import AttributeMap, AttrValue, SpanData
+from litellm.integrations.otel.mappers.utils import collect, drop_none
 from litellm.integrations.otel.payloads import (
     GuardrailSpanData,
     LLMCallSpanData,
     ServiceSpanData,
+    ToolDefinition,
 )
 from litellm.integrations.otel.semconv import Error, GenAI, LiteLLM, Server
 from litellm.integrations.otel.spans import SpanRole
 
 
 class GenAIMapper:
-    """Emits ``gen_ai.*`` (and a few ``litellm.*`` vendor) attributes."""
+
+    _LLM_CALL_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
+        GenAI.OPERATION_NAME: lambda d: d.operation.value,
+        GenAI.PROVIDER_NAME: lambda d: d.provider or None,
+        GenAI.REQUEST_MODEL: lambda d: d.request_model or None,
+        GenAI.REQUEST_TEMPERATURE: lambda d: d.request_params.temperature,
+        GenAI.REQUEST_TOP_P: lambda d: d.request_params.top_p,
+        GenAI.REQUEST_TOP_K: lambda d: d.request_params.top_k,
+        GenAI.REQUEST_MAX_TOKENS: lambda d: d.request_params.max_tokens,
+        GenAI.REQUEST_FREQUENCY_PENALTY: lambda d: d.request_params.frequency_penalty,
+        GenAI.REQUEST_PRESENCE_PENALTY: lambda d: d.request_params.presence_penalty,
+        GenAI.REQUEST_STOP_SEQUENCES: lambda d: (
+            list(d.request_params.stop_sequences)
+            if d.request_params.stop_sequences
+            else None
+        ),
+        GenAI.REQUEST_SEED: lambda d: d.request_params.seed,
+        GenAI.RESPONSE_MODEL: lambda d: d.response_model,
+        GenAI.RESPONSE_ID: lambda d: d.response_id,
+        GenAI.RESPONSE_FINISH_REASONS: lambda d: (
+            list(d.finish_reasons) if d.finish_reasons else None
+        ),
+        GenAI.USAGE_INPUT_TOKENS: lambda d: d.usage.input_tokens,
+        GenAI.USAGE_OUTPUT_TOKENS: lambda d: d.usage.output_tokens,
+        Error.TYPE: lambda d: d.error.error_type if d.error else None,
+        Server.ADDRESS: lambda d: d.server.address if d.server else None,
+        Server.PORT: lambda d: d.server.port if d.server else None,
+        LiteLLM.CALL_ID: lambda d: d.identity.call_id or None,
+        f"{LiteLLM.COST_PREFIX}total": lambda d: d.response_cost,
+        LiteLLM.REQUEST_STREAMING: lambda d: d.is_streaming,
+    }
+
+    _TOOL_ATTRS: Dict[str, Callable[[ToolDefinition], Optional[AttrValue]]] = {
+        "name": lambda t: t.name,
+        "description": lambda t: t.description or None,
+        "parameters": lambda t: t.parameters_json or None,
+    }
+
+    _GUARDRAIL_ATTRS: Dict[str, Callable[[GuardrailSpanData], Optional[AttrValue]]] = {
+        LiteLLM.GUARDRAIL_NAME: lambda d: d.guardrail_name,
+        LiteLLM.GUARDRAIL_MODE: lambda d: d.mode,
+        LiteLLM.GUARDRAIL_STATUS: lambda d: d.status,
+    }
+
+    _SERVICE_ATTRS: Dict[str, Callable[[ServiceSpanData], Optional[AttrValue]]] = {
+        LiteLLM.SERVICE_NAME: lambda d: d.service_name,
+        LiteLLM.SERVICE_CALL_TYPE: lambda d: d.call_type,
+    }
 
     def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        # Dispatch on the concrete data type — ``isinstance`` narrows the union
-        # for mypy and avoids unchecked ``cast`` calls.
-        if isinstance(data, LLMCallSpanData):
-            return self._llm_call(data)
-        if isinstance(data, GuardrailSpanData):
-            return self._guardrail(data)
-        if isinstance(data, ServiceSpanData):
-            return self._service(data)
-        return {}
+        match data:
+            case LLMCallSpanData():
+                return self._llm_call(data)
+            case GuardrailSpanData():
+                return self._guardrail(data)
+            case ServiceSpanData():
+                return self._service(data)
+            case _:
+                return {}
 
-    @staticmethod
-    def _llm_call(data: LLMCallSpanData) -> AttributeMap:
-        rp, u, s, idn = data.request_params, data.usage, data.server, data.identity
-        stop = list(rp.stop_sequences) if rp.stop_sequences else None
-        finishes = list(data.finish_reasons) if data.finish_reasons else None
-        attrs = drop_none(
-            {
-                GenAI.OPERATION_NAME: data.operation.value,
-                GenAI.PROVIDER_NAME: data.provider or None,
-                GenAI.REQUEST_MODEL: data.request_model or None,
-                GenAI.REQUEST_TEMPERATURE: rp.temperature,
-                GenAI.REQUEST_TOP_P: rp.top_p,
-                GenAI.REQUEST_TOP_K: rp.top_k,
-                GenAI.REQUEST_MAX_TOKENS: rp.max_tokens,
-                GenAI.REQUEST_FREQUENCY_PENALTY: rp.frequency_penalty,
-                GenAI.REQUEST_PRESENCE_PENALTY: rp.presence_penalty,
-                GenAI.REQUEST_STOP_SEQUENCES: stop,
-                GenAI.REQUEST_SEED: rp.seed,
-                GenAI.RESPONSE_MODEL: data.response_model,
-                GenAI.RESPONSE_ID: data.response_id,
-                GenAI.RESPONSE_FINISH_REASONS: finishes,
-                GenAI.USAGE_INPUT_TOKENS: u.input_tokens,
-                GenAI.USAGE_OUTPUT_TOKENS: u.output_tokens,
-                Error.TYPE: data.error.error_type if data.error else None,
-                Server.ADDRESS: s.address if s else None,
-                Server.PORT: s.port if s else None,
-                LiteLLM.CALL_ID: idn.call_id or None,
-                f"{LiteLLM.COST_PREFIX}total": data.response_cost,
-                LiteLLM.REQUEST_STREAMING: data.is_streaming,
-            }
+    @classmethod
+    def _llm_call(cls, data: LLMCallSpanData) -> AttributeMap:
+        attrs = collect(cls._LLM_CALL_ATTRS, data)
+        attrs.update(
+            drop_none(
+                {
+                    f"gen_ai.tool.{idx}.{suffix}": extract(tool)
+                    for idx, tool in enumerate(data.tools)
+                    for suffix, extract in cls._TOOL_ATTRS.items()
+                }
+            )
         )
-        # Tools — semconv-aligned ``gen_ai.tool.{idx}.*`` shape.
-        for idx, tool in enumerate(data.tools):
-            attrs[f"gen_ai.tool.{idx}.name"] = tool.name
-            if tool.description:
-                attrs[f"gen_ai.tool.{idx}.description"] = tool.description
-            if tool.parameters_json:
-                attrs[f"gen_ai.tool.{idx}.parameters"] = tool.parameters_json
         return attrs
 
-    @staticmethod
-    def _guardrail(data: GuardrailSpanData) -> AttributeMap:
-        return drop_none(
+    @classmethod
+    def _guardrail(cls, data: GuardrailSpanData) -> AttributeMap:
+        return collect(cls._GUARDRAIL_ATTRS, data)
+
+    @classmethod
+    def _service(cls, data: ServiceSpanData) -> AttributeMap:
+        attrs = collect(cls._SERVICE_ATTRS, data)
+        attrs.update(
             {
-                LiteLLM.GUARDRAIL_NAME: data.guardrail_name,
-                LiteLLM.GUARDRAIL_MODE: data.mode,
-                LiteLLM.GUARDRAIL_STATUS: data.status,
+                f"{LiteLLM.METADATA_PREFIX}{key}": value
+                for key, value in data.event_metadata.items()
             }
         )
-
-    @staticmethod
-    def _service(data: ServiceSpanData) -> AttributeMap:
-        attrs: AttributeMap = {LiteLLM.SERVICE_NAME: data.service_name}
-        if data.call_type is not None:
-            attrs[LiteLLM.SERVICE_CALL_TYPE] = data.call_type
-        # Caller-supplied event_metadata goes under the canonical metadata
-        # namespace (the legacy mapper duplicates them bare for V1 dashboards).
-        for key, value in data.event_metadata.items():
-            attrs[f"{LiteLLM.METADATA_PREFIX}{key}"] = value
         return attrs

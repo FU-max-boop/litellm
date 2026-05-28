@@ -1,13 +1,18 @@
-"""Dual-emit mapper: deprecated attribute keys kept for backward compatibility."""
+"""Dual-emit mapper: deprecated attribute keys kept for backward compatibility.
 
-from typing import Final
+Like ``GenAIMapper``, each span kind declares its schema as a flat
+``attribute key -> extractor`` table: one lambda per mapping operation.
+"""
 
-from litellm.integrations.otel.mappers.base import (
-    AttributeMap,
-    SpanData,
-    drop_none,
+from typing import Callable, Dict, Final, Optional
+
+from litellm.integrations.otel.mappers.base import AttributeMap, AttrValue, SpanData
+from litellm.integrations.otel.mappers.utils import collect, drop_none
+from litellm.integrations.otel.payloads import (
+    LLMCallSpanData,
+    ServiceSpanData,
+    ToolDefinition,
 )
-from litellm.integrations.otel.payloads import LLMCallSpanData, ServiceSpanData
 from litellm.integrations.otel.spans import SpanRole
 
 # Deprecated keys (semconv-ai / Traceloop era).
@@ -20,8 +25,6 @@ _LEGACY_TOP_K: Final = "llm.top_k"
 _LEGACY_FREQUENCY_PENALTY: Final = "llm.frequency_penalty"
 _LEGACY_PRESENCE_PENALTY: Final = "llm.presence_penalty"
 _LEGACY_STOP_SEQUENCES: Final = "llm.chat.stop_sequences"
-# Service-span bare keys used by V1 (no namespace). Dual-emitted for any
-# dashboard that filters on them today.
 _LEGACY_SERVICE: Final = "service"
 _LEGACY_CALL_TYPE: Final = "call_type"
 _LEGACY_ERROR: Final = "error"
@@ -30,48 +33,61 @@ _LEGACY_ERROR: Final = "error"
 class LegacyMapper:
     """Re-emits values under their deprecated key names (LLM-call + service)."""
 
-    def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        if isinstance(data, LLMCallSpanData):
-            return self._llm_call(data)
-        if isinstance(data, ServiceSpanData):
-            return self._service(data)
-        return {}
+    _LLM_CALL_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
+        _LEGACY_SYSTEM: lambda d: d.provider or None,
+        _LEGACY_PROMPT_TOKENS: lambda d: d.usage.input_tokens,
+        _LEGACY_COMPLETION_TOKENS: lambda d: d.usage.output_tokens,
+        _LEGACY_TOTAL_TOKENS: lambda d: d.usage.total_tokens,
+        _LEGACY_IS_STREAMING: lambda d: d.is_streaming,
+        _LEGACY_TOP_K: lambda d: d.request_params.top_k,
+        _LEGACY_FREQUENCY_PENALTY: lambda d: d.request_params.frequency_penalty,
+        _LEGACY_PRESENCE_PENALTY: lambda d: d.request_params.presence_penalty,
+        _LEGACY_STOP_SEQUENCES: lambda d: (
+            list(d.request_params.stop_sequences)
+            if d.request_params.stop_sequences
+            else None
+        ),
+    }
 
-    @staticmethod
-    def _llm_call(data: LLMCallSpanData) -> AttributeMap:
-        rp, u = data.request_params, data.usage
-        stop = list(rp.stop_sequences) if rp.stop_sequences else None
-        attrs = drop_none(
-            {
-                _LEGACY_SYSTEM: data.provider or None,
-                _LEGACY_PROMPT_TOKENS: u.input_tokens,
-                _LEGACY_COMPLETION_TOKENS: u.output_tokens,
-                _LEGACY_TOTAL_TOKENS: u.total_tokens,
-                _LEGACY_IS_STREAMING: data.is_streaming,
-                _LEGACY_TOP_K: rp.top_k,
-                _LEGACY_FREQUENCY_PENALTY: rp.frequency_penalty,
-                _LEGACY_PRESENCE_PENALTY: rp.presence_penalty,
-                _LEGACY_STOP_SEQUENCES: stop,
-            }
+    _TOOL_ATTRS: Dict[str, Callable[[ToolDefinition], Optional[AttrValue]]] = {
+        "name": lambda t: t.name,
+        "description": lambda t: t.description or None,
+        "parameters": lambda t: t.parameters_json or None,
+    }
+
+    _SERVICE_ATTRS: Dict[str, Callable[[ServiceSpanData], Optional[AttrValue]]] = {
+        _LEGACY_SERVICE: lambda d: d.service_name,
+        _LEGACY_CALL_TYPE: lambda d: d.call_type,
+        _LEGACY_ERROR: lambda d: (
+            d.error.message if d.error is not None and d.error.message else None
+        ),
+    }
+
+    def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
+        match data:
+            case LLMCallSpanData():
+                return self._llm_call(data)
+            case ServiceSpanData():
+                return self._service(data)
+            case _:
+                return {}
+
+    @classmethod
+    def _llm_call(cls, data: LLMCallSpanData) -> AttributeMap:
+        attrs = collect(cls._LLM_CALL_ATTRS, data)
+        attrs.update(
+            drop_none(
+                {
+                    f"llm.request.functions.{idx}.{suffix}": extract(tool)
+                    for idx, tool in enumerate(data.tools)
+                    for suffix, extract in cls._TOOL_ATTRS.items()
+                }
+            )
         )
-        # V1 stamps tool definitions under ``llm.request.functions.{idx}.*``.
-        for idx, tool in enumerate(data.tools):
-            attrs[f"llm.request.functions.{idx}.name"] = tool.name
-            if tool.description:
-                attrs[f"llm.request.functions.{idx}.description"] = tool.description
-            if tool.parameters_json:
-                attrs[f"llm.request.functions.{idx}.parameters"] = tool.parameters_json
         return attrs
 
-    @staticmethod
-    def _service(data: ServiceSpanData) -> AttributeMap:
-        # V1 stamps these as bare keys (no namespace) on the service span.
-        attrs: AttributeMap = {_LEGACY_SERVICE: data.service_name}
-        if data.call_type is not None:
-            attrs[_LEGACY_CALL_TYPE] = data.call_type
-        if data.error is not None and data.error.message:
-            attrs[_LEGACY_ERROR] = data.error.message
-        # V1 stamps event_metadata sub-keys bare (under the user-supplied names).
-        for key, value in data.event_metadata.items():
-            attrs[key] = value
+    @classmethod
+    def _service(cls, data: ServiceSpanData) -> AttributeMap:
+        attrs = collect(cls._SERVICE_ATTRS, data)
+        attrs.update(dict(data.event_metadata))
         return attrs

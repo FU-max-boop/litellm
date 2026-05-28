@@ -6,9 +6,10 @@ OpenInference's vocabulary — compose ``["genai", "openinference", "weave"]``
 to feed a Weave backend.
 """
 
-import json
+from typing import Callable, Dict, Optional
 
-from litellm.integrations.otel.mappers.base import AttributeMap, SpanData
+from litellm.integrations.otel.mappers.base import AttributeMap, AttrValue, SpanData
+from litellm.integrations.otel.mappers.utils import collect, json_or_none
 from litellm.integrations.otel.payloads import LLMCallSpanData
 from litellm.integrations.otel.spans import SpanRole
 
@@ -16,20 +17,33 @@ from litellm.integrations.otel.spans import SpanRole
 class WeaveMapper:
     """Maps ``LLMCallSpanData`` to Weave's vendor attributes."""
 
-    def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        if not isinstance(data, LLMCallSpanData):
-            return {}
-        attrs: AttributeMap = {}
+    _LLM_CALL_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
         # ``display_name`` follows V1's ``{operation} {model}`` form, but the
         # canonical span name already covers that — Weave reads the attr too.
-        if data.request_model:
-            attrs["weave.display_name"] = f"{data.operation.value} {data.request_model}"
-        if data.identity.call_id:
-            attrs["weave.call_id"] = data.identity.call_id
+        "weave.display_name": lambda d: (
+            f"{d.operation.value} {d.request_model}" if d.request_model else None
+        ),
+        "weave.call_id": lambda d: d.identity.call_id or None,
+    }
+
+    # JSON-payload attributes: each builder returns the serialized blob or None.
+    _BLOB_ATTRS: Dict[str, Callable[[LLMCallSpanData], Optional[AttrValue]]] = {
         # Weave treats the response choices as the "output" payload.
-        if data.choices_out:
-            try:
-                attrs["weave.output"] = json.dumps(list(data.choices_out), default=str)
-            except Exception:
-                pass
-        return attrs
+        "weave.output": lambda d: (
+            json_or_none(list(d.choices_out)) if d.choices_out else None
+        ),
+    }
+
+    def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
+        match data:
+            case LLMCallSpanData():
+                return self._llm_call(data)
+            case _:
+                return {}
+
+    @classmethod
+    def _llm_call(cls, data: LLMCallSpanData) -> AttributeMap:
+        return {
+            **collect(cls._LLM_CALL_ATTRS, data),
+            **collect(cls._BLOB_ATTRS, data),
+        }

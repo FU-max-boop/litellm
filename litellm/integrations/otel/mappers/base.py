@@ -1,6 +1,4 @@
-"""Mapper protocol and attribute value types."""
-
-from typing import Dict, Mapping, Optional, Sequence, Union
+from typing import Dict, Sequence, Union
 
 from typing_extensions import Protocol, runtime_checkable
 
@@ -27,11 +25,6 @@ AttributeMap = Dict[str, AttrValue]
 # Wider span roles (PROXY_REQUEST, MANAGEMENT) are root spans owned by callers
 # and don't flow through ``emit``.
 SpanData = Union[LLMCallSpanData, GuardrailSpanData, ServiceSpanData]
-
-
-def drop_none(values: Mapping[str, Optional[AttrValue]]) -> AttributeMap:
-    """Return ``values`` with ``None``-valued entries removed."""
-    return {k: v for k, v in values.items() if v is not None}
 
 
 @runtime_checkable
