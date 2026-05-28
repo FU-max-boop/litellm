@@ -229,6 +229,17 @@ class ManagementSpanData:
 
 
 @dataclass(frozen=True)
+class ToolDefinition:
+    """A single function/tool declared on a chat-completion request."""
+
+    name: str
+    description: Optional[str] = None
+    parameters_json: Optional[str] = (
+        None  # JSON-serialized schema (str so it's an AttrValue)
+    )
+
+
+@dataclass(frozen=True)
 class LLMCallSpanData:
     operation: GenAIOperation
     provider: str
@@ -243,6 +254,15 @@ class LLMCallSpanData:
     server: Optional[ServerInfo]
     identity: RequestIdentity
     is_streaming: Optional[bool] = None
+    tools: Tuple[ToolDefinition, ...] = ()
+    # Raw messages + response — needed by vendor mappers (OpenInference,
+    # Langfuse, Weave) that stamp message-level attributes. ``messages_in`` is
+    # the request payload, ``choices_out`` mirrors ``response.choices`` from
+    # the StandardLoggingPayload. Both are typed as immutable mappings so the
+    # dataclass stays hashable / frozen.
+    messages_in: Tuple[Mapping[str, object], ...] = ()
+    choices_out: Tuple[Mapping[str, object], ...] = ()
+    system_fingerprint: Optional[str] = None
 
     @classmethod
     def from_standard_logging_payload(
@@ -279,6 +299,17 @@ class LLMCallSpanData:
             )
 
         hidden_params = cast(Mapping[str, object], payload.get("hidden_params") or {})
+        messages_in: Tuple[Mapping[str, object], ...] = ()
+        raw_messages = payload.get("messages")
+        if isinstance(raw_messages, list):
+            messages_in = tuple(m for m in raw_messages if isinstance(m, dict))
+        choices_out: Tuple[Mapping[str, object], ...] = ()
+        system_fingerprint: Optional[str] = None
+        if isinstance(response, dict):
+            raw_choices = response.get("choices")
+            if isinstance(raw_choices, list):
+                choices_out = tuple(c for c in raw_choices if isinstance(c, dict))
+            system_fingerprint = _as_str(response.get("system_fingerprint"))
         return cls(
             operation=resolve_operation(_as_str(payload.get("call_type"))),
             provider=resolve_provider(_as_str(payload.get("custom_llm_provider"))),
@@ -300,7 +331,53 @@ class LLMCallSpanData:
             ),
             identity=RequestIdentity.from_payload(payload),
             is_streaming=_as_bool(payload.get("stream")),
+            tools=_extract_tools(model_parameters),
+            messages_in=messages_in,
+            choices_out=choices_out,
+            system_fingerprint=system_fingerprint,
         )
+
+
+def _extract_tools(
+    model_parameters: Mapping[str, object],
+) -> Tuple[ToolDefinition, ...]:
+    """Pull ``tools`` (the OpenAI / Anthropic function-calling shape) from request params.
+
+    Accepts the chat-completion ``tools=[{"type":"function", "function": {...}}, ...]``
+    shape; tolerates older ``functions=[...]`` shape too. Empty tuple if absent.
+    """
+    import json as _json
+
+    raw_tools = model_parameters.get("tools")
+    if not isinstance(raw_tools, list):
+        raw_tools = model_parameters.get("functions")  # legacy OpenAI shape
+    if not isinstance(raw_tools, list):
+        return ()
+    out: List[ToolDefinition] = []
+    for entry in raw_tools:
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get("function") if "function" in entry else entry
+        if not isinstance(fn, dict):
+            continue
+        name = _as_str(fn.get("name"))
+        if not name:
+            continue
+        params = fn.get("parameters")
+        params_json: Optional[str] = None
+        if params is not None:
+            try:
+                params_json = _json.dumps(params, default=str)
+            except Exception:
+                params_json = None
+        out.append(
+            ToolDefinition(
+                name=name,
+                description=_as_str(fn.get("description")),
+                parameters_json=params_json,
+            )
+        )
+    return tuple(out)
 
 
 def promoted_baggage(

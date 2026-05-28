@@ -41,7 +41,7 @@ class LegacyMapper:
     def _llm_call(data: LLMCallSpanData) -> AttributeMap:
         rp, u = data.request_params, data.usage
         stop = list(rp.stop_sequences) if rp.stop_sequences else None
-        return drop_none(
+        attrs = drop_none(
             {
                 _LEGACY_SYSTEM: data.provider or None,
                 _LEGACY_PROMPT_TOKENS: u.input_tokens,
@@ -54,6 +54,14 @@ class LegacyMapper:
                 _LEGACY_STOP_SEQUENCES: stop,
             }
         )
+        # V1 stamps tool definitions under ``llm.request.functions.{idx}.*``.
+        for idx, tool in enumerate(data.tools):
+            attrs[f"llm.request.functions.{idx}.name"] = tool.name
+            if tool.description:
+                attrs[f"llm.request.functions.{idx}.description"] = tool.description
+            if tool.parameters_json:
+                attrs[f"llm.request.functions.{idx}.parameters"] = tool.parameters_json
+        return attrs
 
     @staticmethod
     def _service(data: ServiceSpanData) -> AttributeMap:

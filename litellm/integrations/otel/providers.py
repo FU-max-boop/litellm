@@ -1,9 +1,15 @@
-"""Provider/exporter factory and the Baggage span processor.
+"""Provider / exporter factory + the Baggage span processor.
 
-OTLP exporter imports are performed lazily inside :func:`build_span_exporter`
+One ``TracerProvider`` per process; *N* ``SpanProcessor``s attached, one per
+:class:`~litellm.integrations.otel.config.ExporterSpec`. That replaces V1's
+"one private TracerProvider per integration" hack: instead of building parallel
+provider singletons, the same trace flows through every configured exporter.
+
+OTLP exporter imports are lazy inside :func:`build_span_exporter` so importing
+this module never pulls in ``grpc``.
 """
 
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from opentelemetry import baggage
 from opentelemetry.context import Context
@@ -20,7 +26,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 from opentelemetry.trace import Span, SpanKind, Tracer
 
-from litellm.integrations.otel.config import OpenTelemetryV2Config
+from litellm.integrations.otel.config import ExporterSpec, OpenTelemetryV2Config
 from litellm.integrations.otel.semconv import LiteLLM
 from litellm.integrations.otel.spans import LiteLLMSpanKind
 
@@ -69,7 +75,6 @@ class LiteLLMBaggageSpanProcessor(SpanProcessor):
 
 
 def parse_headers(raw: Optional[str]) -> Dict[str, str]:
-    """Parse an ``"k=v,k2=v2"`` header string into a dict."""
     headers: Dict[str, str] = {}
     if not raw:
         return headers
@@ -80,33 +85,52 @@ def parse_headers(raw: Optional[str]) -> Dict[str, str]:
     return headers
 
 
-def build_span_exporter(config: OpenTelemetryV2Config) -> SpanExporter:
-    exporter = (config.exporter or "console").lower()
-    if exporter in ("in_memory", "inmemory", "memory"):
+def _exporter_from_spec(spec: ExporterSpec) -> SpanExporter:
+    kind = (spec.kind or "console").lower()
+    if kind in ("in_memory", "inmemory", "memory"):
         return InMemorySpanExporter()
-    if exporter in ("otlp_http", "http", "http/protobuf", "http/json"):
+    if kind in ("otlp_http", "http", "http/protobuf", "http/json"):
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
             OTLPSpanExporter as HTTPExporter,
         )
 
-        return HTTPExporter(
-            endpoint=config.endpoint, headers=parse_headers(config.headers)
-        )
-    if exporter in ("otlp_grpc", "grpc"):
+        return HTTPExporter(endpoint=spec.endpoint, headers=parse_headers(spec.headers))
+    if kind in ("otlp_grpc", "grpc"):
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
             OTLPSpanExporter as GRPCExporter,
         )
 
-        return GRPCExporter(
-            endpoint=config.endpoint, headers=parse_headers(config.headers)
-        )
+        return GRPCExporter(endpoint=spec.endpoint, headers=parse_headers(spec.headers))
     return ConsoleSpanExporter()
+
+
+def _processor_for(exporter: SpanExporter, use_simple: Optional[bool]) -> SpanProcessor:
+    """Pick Simple vs Batch. Default: Simple for console/in-memory (synchronous
+    test ergonomics), Batch otherwise (production export semantics).
+    """
+    if use_simple is None:
+        use_simple = isinstance(exporter, (ConsoleSpanExporter, InMemorySpanExporter))
+    return SimpleSpanProcessor(exporter) if use_simple else BatchSpanProcessor(exporter)
+
+
+def build_span_exporter(config: OpenTelemetryV2Config) -> SpanExporter:
+    """Single-exporter convenience used by older call sites + tests.
+
+    Reads the legacy ``exporter`` / ``endpoint`` / ``headers`` triple. New code
+    should configure ``config.exporters`` directly.
+    """
+    return _exporter_from_spec(
+        ExporterSpec(
+            kind=config.exporter, endpoint=config.endpoint, headers=config.headers
+        )
+    )
 
 
 def build_resource(config: OpenTelemetryV2Config) -> Resource:
     attributes: Dict[str, str] = {"service.name": config.service_name}
     if config.deployment_environment:
         attributes["deployment.environment"] = config.deployment_environment
+    attributes.update(config.resource_attributes)
     return Resource.create(attributes)
 
 
@@ -116,10 +140,12 @@ def build_tracer_provider(
     baggage_processor: Optional[SpanProcessor] = None,
     use_simple_processor: Optional[bool] = None,
 ) -> TracerProvider:
-    """Build a :class:`TracerProvider` wired with the baggage + export processors.
+    """Build the shared :class:`TracerProvider`.
 
-    The baggage processor is registered first so identity attributes are stamped
-    on ``on_start`` before any export decision.
+    Attaches the Baggage processor first (so identity attrs land before any
+    export decision), then one ``SpanProcessor`` per ``config.exporters``
+    entry — that's how multi-backend works. ``exporter`` and
+    ``use_simple_processor`` are back-compat overrides for tests.
     """
     provider = TracerProvider(resource=build_resource(config))
     if baggage_processor is None:
@@ -128,17 +154,31 @@ def build_tracer_provider(
         )
     provider.add_span_processor(baggage_processor)
 
-    span_exporter = exporter if exporter is not None else build_span_exporter(config)
-    if use_simple_processor is None:
-        use_simple_processor = isinstance(
-            span_exporter, (ConsoleSpanExporter, InMemorySpanExporter)
-        )
-    export_processor: SpanProcessor = (
-        SimpleSpanProcessor(span_exporter)
-        if use_simple_processor
-        else BatchSpanProcessor(span_exporter)
+    if exporter is not None:
+        provider.add_span_processor(_processor_for(exporter, use_simple_processor))
+        return provider
+
+    specs: List[ExporterSpec] = (
+        list(config.exporters)
+        if config.exporters
+        else [
+            ExporterSpec(
+                kind=config.exporter, endpoint=config.endpoint, headers=config.headers
+            )
+        ]
     )
-    provider.add_span_processor(export_processor)
+    for spec in specs:
+        exp = _exporter_from_spec(spec)
+        provider.add_span_processor(
+            _processor_for(
+                exp,
+                (
+                    spec.use_simple_processor
+                    if spec.use_simple_processor is not None
+                    else use_simple_processor
+                ),
+            )
+        )
     return provider
 
 

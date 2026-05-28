@@ -37,7 +37,7 @@ class GenAIMapper:
         rp, u, s, idn = data.request_params, data.usage, data.server, data.identity
         stop = list(rp.stop_sequences) if rp.stop_sequences else None
         finishes = list(data.finish_reasons) if data.finish_reasons else None
-        return drop_none(
+        attrs = drop_none(
             {
                 GenAI.OPERATION_NAME: data.operation.value,
                 GenAI.PROVIDER_NAME: data.provider or None,
@@ -63,6 +63,14 @@ class GenAIMapper:
                 LiteLLM.REQUEST_STREAMING: data.is_streaming,
             }
         )
+        # Tools — semconv-aligned ``gen_ai.tool.{idx}.*`` shape.
+        for idx, tool in enumerate(data.tools):
+            attrs[f"gen_ai.tool.{idx}.name"] = tool.name
+            if tool.description:
+                attrs[f"gen_ai.tool.{idx}.description"] = tool.description
+            if tool.parameters_json:
+                attrs[f"gen_ai.tool.{idx}.parameters"] = tool.parameters_json
+        return attrs
 
     @staticmethod
     def _guardrail(data: GuardrailSpanData) -> AttributeMap:
